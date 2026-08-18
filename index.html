@@ -345,6 +345,8 @@
                         <div class="wave-bar"></div>
                         <div class="wave-bar"></div>
                     </div>
+                    <p id="detectedKeyText" style="display: none; margin: 0; font-size: 0.85rem; color: #38bdf8; font-weight: 700;">🎼 감지된 조성(추정): -</p>
+                    <p id="micDebugText" style="display: none; margin: 0; font-size: 0.7rem; color: #64748b;">마이크 볼륨: 0.000 (오디오 엔진: -)</p>
                     <button class="btn" id="toggleListenBtn" onclick="toggleListening()" style="width: 100%; margin-top: 4px;">
                         🎤 연주 소리 듣고 자동 넘기기 시작
                     </button>
@@ -532,6 +534,25 @@ G        D/F#    Em
         const SILENCE_RMS = 0.008;      // 이 이하로 떨어지면 "조용해짐"으로 판단
         const SILENCE_HOLD_MS = 600;    // 이만큼 계속 조용해야 "쉬는 구간"으로 확정
         const MIN_PAGE_DWELL_MS = 4000; // 페이지 넘긴 뒤 최소 이 시간은 다시 안 넘김 (너무 자주 넘어가는 것 방지)
+
+        // ---------- 실시간 조성(Key) 추정 ----------
+        // 음악 정보 검색(MIR) 분야에서 널리 쓰이는 방법을 그대로 구현한다.
+        // 1) 마이크 소리를 주파수 성분(FFT)으로 쪼갠다.
+        // 2) 각 주파수를 12개 음이름(C, C#, D ... B) 중 하나로 분류해서 에너지를 누적한다 (= 크로마 벡터).
+        // 3) 이 12개 값의 분포를, 사람들이 실제로 "이 조성처럼 들린다"고 느끼는 통계적 프로파일
+        //    (Krumhansl-Schmuckler 키 프로파일, 음악심리학에서 검증된 값)와 비교해서 가장 비슷한 조성을 고른다.
+        // 코드/멜로디를 "읽어서 아는" 게 아니라 통계적 추정이라, 여러 악기가 겹치거나 시끄러우면 틀릴 수 있다.
+        const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+        const KEY_PROFILE_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+        const KEY_PROFILE_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+        const CHROMA_MIN_FREQ = 80;    // 이 아래(너무 낮은 저음)는 배음 분석용으로만 약하게 반영
+        const CHROMA_MAX_FREQ = 2000;  // 이 위(너무 높은 배음/잡음)는 무시
+        const CHROMA_DECAY = 0.985;    // 매 tick마다 예전 소리의 영향을 아주 살짝만 줄여서, "지금 코드"가 아니라 "곡 전체의 조성"에 가깝게 누적
+        const KEY_UPDATE_MS = 1200;    // 이만큼마다 한 번씩 "지금까지 들은 걸로 조성 다시 추정"
+
+        let chromaAccum = new Array(12).fill(0);
+        let keyUpdateAccumMs = 0;
+        let freqDataBuffer = null; // Float32Array, reused every tick to avoid re-allocating
 
         const pagesContent = {
             1: `[Verse 1]\nG        D/F#    Em\n낮은 자의 오셔서\n      C         D\n기도를 들으시는 주\nG        D/F#    Em\n주님 앞에 나아가\n      C          D    G\n주의 얼굴 구합니다`,
@@ -730,8 +751,24 @@ G        D/F#    Em
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
             const source = audioContext.createMediaStreamSource(micStream);
             analyserNode = audioContext.createAnalyser();
-            analyserNode.fftSize = 1024;
+            // 4096으로 크게 잡아야 저음역대 음까지 어느 정도 구분되는 주파수 해상도가 나온다
+            // (조성 추정에 쓸 FFT 데이터도 이 analyser에서 같이 뽑아 쓴다).
+            analyserNode.fftSize = 4096;
+            analyserNode.smoothingTimeConstant = 0.4;
             source.connect(analyserNode);
+            freqDataBuffer = new Float32Array(analyserNode.frequencyBinCount);
+            chromaAccum = new Array(12).fill(0);
+            keyUpdateAccumMs = 0;
+
+            // 일부 브라우저는 오디오 엔진(AudioContext)을 "일시정지" 상태로 만들어두는데,
+            // 이 상태면 마이크 권한은 허용됐어도 실제 소리 분석은 멈춰 있다. 명시적으로 깨워준다.
+            if (audioContext.state === 'suspended') {
+                try {
+                    await audioContext.resume();
+                } catch (e) {
+                    // ignore — 아래 audioTick에서 상태를 계속 보여주므로 눈으로 확인 가능
+                }
+            }
 
             isListening = true;
             lastAutoTurnTime = Date.now();
@@ -743,6 +780,10 @@ G        D/F#    Em
             statusPill.classList.add('listening');
             statusPill.innerHTML = '<span style="font-size: 0.5rem;">🎧</span> 듣는 중';
             document.getElementById('visualizer').style.display = 'flex';
+            document.getElementById('micDebugText').style.display = 'block';
+            const keyEl = document.getElementById('detectedKeyText');
+            keyEl.style.display = 'block';
+            keyEl.textContent = '🎼 감지된 조성(추정): 분석 중...';
 
             audioLoopHandle = setInterval(audioTick, AUDIO_TICK_MS);
         }
@@ -776,12 +817,20 @@ G        D/F#    Em
             visualizer.querySelectorAll('.wave-bar').forEach(function (bar) {
                 bar.style.height = '';
             });
+            document.getElementById('micDebugText').style.display = 'none';
+            document.getElementById('detectedKeyText').style.display = 'none';
         }
 
         // 100ms마다 실제 마이크 볼륨(RMS)을 재서 시각화 막대에 반영하고,
         // "한동안 연주 -> 잠깐 멈춤" 패턴이 감지되면 다음 페이지로 넘긴다.
         function audioTick() {
             if (!analyserNode) return;
+
+            // 혹시 여전히 일시정지 상태라면 계속 깨우기를 시도한다 (일부 브라우저는
+            // 첫 시도에서 안 깨어나고 몇 번 더 시도해야 정상 작동하기도 한다).
+            if (audioContext && audioContext.state === 'suspended') {
+                audioContext.resume().catch(function () {});
+            }
 
             const data = new Float32Array(analyserNode.fftSize);
             analyserNode.getFloatTimeDomainData(data);
@@ -793,6 +842,11 @@ G        D/F#    Em
             const rms = Math.sqrt(sumSquares / data.length);
 
             updateVisualizer(rms);
+
+            const debugEl = document.getElementById('micDebugText');
+            if (debugEl) {
+                debugEl.textContent = '마이크 볼륨: ' + rms.toFixed(4) + ' (오디오 엔진: ' + (audioContext ? audioContext.state : '-') + ')';
+            }
 
             if (rms >= ACTIVE_RMS) {
                 hadActivitySinceLastTurn = true;
@@ -812,6 +866,104 @@ G        D/F#    Em
                 lastAutoTurnTime = now;
                 changePage(1, true);
             }
+
+            // 소리가 날 때만 조성 추정용 크로마(음이름별 에너지)를 누적한다.
+            if (rms >= SILENCE_RMS) {
+                accumulateChromaFrame();
+            }
+            keyUpdateAccumMs += AUDIO_TICK_MS;
+            if (keyUpdateAccumMs >= KEY_UPDATE_MS) {
+                keyUpdateAccumMs = 0;
+                updateKeyDisplay();
+            }
+        }
+
+        // 현재 순간의 소리를 주파수 성분으로 쪼개서, 12개 음이름 각각에 에너지를 더한다.
+        function accumulateChromaFrame() {
+            analyserNode.getFloatFrequencyData(freqDataBuffer); // dB 단위, 조용하면 -100 근처
+            const sampleRate = audioContext.sampleRate;
+            const binHz = sampleRate / analyserNode.fftSize;
+
+            // 오래된 소리의 영향은 서서히 줄이고, 이번 프레임 값을 더한다.
+            for (let i = 0; i < 12; i++) {
+                chromaAccum[i] *= CHROMA_DECAY;
+            }
+
+            const minBin = Math.max(1, Math.floor(CHROMA_MIN_FREQ / binHz));
+            const maxBin = Math.min(freqDataBuffer.length - 1, Math.ceil(CHROMA_MAX_FREQ / binHz));
+
+            for (let bin = minBin; bin <= maxBin; bin++) {
+                const db = freqDataBuffer[bin];
+                if (db < -90) continue; // 사실상 무음인 성분은 무시 (잡음에 흔들리지 않도록)
+
+                const freq = bin * binHz;
+                const magnitude = Math.pow(10, db / 20); // dB -> 선형 크기
+
+                const midi = 69 + 12 * Math.log2(freq / 440);
+                const pitchClass = ((Math.round(midi) % 12) + 12) % 12;
+                chromaAccum[pitchClass] += magnitude;
+            }
+        }
+
+        // 지금까지 누적된 크로마 벡터를, 장조/단조 24개 프로파일과 비교해서 가장 비슷한 조성을 고른다.
+        // (Krumhansl-Schmuckler 키 찾기 알고리즘)
+        function estimateKey() {
+            const totalEnergy = chromaAccum.reduce(function (a, b) { return a + b; }, 0);
+            if (totalEnergy < 1e-6) return null; // 아직 들은 소리가 거의 없음
+
+            let best = null;
+            for (let rotation = 0; rotation < 12; rotation++) {
+                const majorScore = correlate(chromaAccum, rotateProfile(KEY_PROFILE_MAJOR, rotation));
+                const minorScore = correlate(chromaAccum, rotateProfile(KEY_PROFILE_MINOR, rotation));
+
+                if (!best || majorScore > best.score) {
+                    best = { tonic: NOTE_NAMES[rotation], mode: 'Major', score: majorScore };
+                }
+                if (!best || minorScore > best.score) {
+                    best = { tonic: NOTE_NAMES[rotation], mode: 'minor', score: minorScore };
+                }
+            }
+            return best;
+        }
+
+        function rotateProfile(profile, rotation) {
+            const rotated = new Array(12);
+            for (let i = 0; i < 12; i++) {
+                rotated[i] = profile[(i - rotation + 12) % 12];
+            }
+            return rotated;
+        }
+
+        // 피어슨 상관계수: 두 12차원 벡터의 "모양"이 얼마나 비슷한지 (-1~1, 1에 가까울수록 유사)
+        function correlate(a, b) {
+            const n = a.length;
+            const meanA = a.reduce(function (x, y) { return x + y; }, 0) / n;
+            const meanB = b.reduce(function (x, y) { return x + y; }, 0) / n;
+
+            let num = 0, denomA = 0, denomB = 0;
+            for (let i = 0; i < n; i++) {
+                const da = a[i] - meanA;
+                const db = b[i] - meanB;
+                num += da * db;
+                denomA += da * da;
+                denomB += db * db;
+            }
+            const denom = Math.sqrt(denomA * denomB);
+            return denom === 0 ? 0 : num / denom;
+        }
+
+        function updateKeyDisplay() {
+            const keyEl = document.getElementById('detectedKeyText');
+            if (!keyEl || keyEl.style.display === 'none') return;
+
+            const result = estimateKey();
+            if (!result) {
+                keyEl.textContent = '🎼 감지된 조성(추정): 분석 중... (소리를 더 들어야 해요)';
+                return;
+            }
+            // score(상관계수)가 낮으면 "이 정도면 확실하다"고 말하기 어려우니 신뢰도 표시를 같이 해준다
+            const confidence = result.score >= 0.7 ? '높음' : (result.score >= 0.4 ? '보통' : '낮음');
+            keyEl.textContent = '🎼 감지된 조성(추정): ' + result.tonic + ' ' + result.mode + ' (신뢰도: ' + confidence + ')';
         }
 
         // 실제 마이크 음량 크기에 맞춰 오디오 비주얼라이저 막대 높이를 실시간으로 바꿔준다.
